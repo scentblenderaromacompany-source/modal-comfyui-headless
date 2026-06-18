@@ -96,17 +96,24 @@ image = (
     .run_commands(
         "comfy --skip-prompt install --nvidia",
         "git lfs install",
-        # Install frame interpolation nodes (each step separate for error isolation)
-        "cd /root/comfy/ComfyUI/custom_nodes || true",
-        "git clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git 2>/dev/null || echo 'Frame-Interpolation already exists'",
-        "cd /root/comfy/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation && pip install -r requirements.txt --quiet || true",
+        # Install frame interpolation custom node
+        "cd /root/comfy/ComfyUI/custom_nodes && "
+        "git clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git 2>/dev/null || true",
+        "cd /root/comfy/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation && "
+        "pip install -r requirements.txt --quiet 2>/dev/null || true",
         # Install Video Helper Suite
-        "cd /root/comfy/ComfyUI/custom_nodes",
-        "git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git 2>/dev/null || echo 'VHS already exists'",
-        "cd /root/comfy/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite && pip install -r requirements.txt --quiet || true",
-        # Download RIFE model
-        "mkdir -p /root/comfy/ComfyUI/models/rife",
-        "cd /root/comfy/ComfyUI/models/rife && wget -q --timeout=30 https://huggingface.co/datasets/nicolai256/RIFE_checkpoints/resolve/main/flownet.pkl || echo 'RIFE model download failed, will use fallback'",
+        "cd /root/comfy/ComfyUI/custom_nodes && "
+        "git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git 2>/dev/null || true",
+        "cd /root/comfy/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite && "
+        "pip install -r requirements.txt --quiet 2>/dev/null || true",
+        # Download RIFE model to the correct directory for FrameInterpolationModelLoader
+        "mkdir -p /root/comfy/ComfyUI/models/frame_interpolation && "
+        "cd /root/comfy/ComfyUI/models/frame_interpolation && "
+        "wget -q --timeout=60 https://huggingface.co/datasets/nicolai256/RIFE_checkpoints/resolve/main/flownet.pkl || "
+        "wget -q --timeout=60 https://github.com/h94/IP-Adapter/raw/main/models/rife/flownet.pkl || true",
+        # Also download to rife dir for compatibility
+        "mkdir -p /root/comfy/ComfyUI/models/rife && "
+        "cp /root/comfy/ComfyUI/models/frame_interpolation/flownet.pkl /root/comfy/ComfyUI/models/rife/ 2>/dev/null || true",
     )
 )
 
@@ -513,39 +520,34 @@ def serve():
             workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
             keyframe_save_nodes.append(n_save)
 
-        # RIFE interpolation between consecutive keyframes
-        interpolated_nodes = []
+        # Frame interpolation between consecutive keyframes
+        interpolated = []
         for i in range(len(keyframe_save_nodes) - 1):
+            n_model = nid()
             n_rife = nid()
+            workflow[n_model] = {
+                "class_type": "FrameInterpolationModelLoader",
+                "inputs": {"model_name": "flownet.pkl"}
+            }
             workflow[n_rife] = {
-                "class_type": "RIFE_VFI",
+                "class_type": "FrameInterpolate",
                 "inputs": {
-                    "ckpt_name": "flownet.pkl",
-                    "frames": [keyframe_save_nodes[i], 0],
-                    "optional_interpolation_states": None,
+                    "interp_model": [n_model, 0],
+                    "images": [keyframe_save_nodes[i], 0],
                     "multiplier": frames_per_keyframe,
-                    "fast_mode": True,
-                    "ensemble": True,
-                    "scale_factor": 1.0,
                 }
             }
-            interpolated_nodes.append(n_rife)
+            interpolated.append(n_rife)
 
-        # Combine into video
-        if interpolated_nodes:
-            n_video = nid()
-            workflow[n_video] = {
-                "class_type": "VHS_VideoCombine",
+        # Save output (use SaveAnimatedPNG since VHS may not be available)
+        if interpolated:
+            n_save = nid()
+            workflow[n_save] = {
+                "class_type": "SaveAnimatedPNG",
                 "inputs": {
-                    "images": [interpolated_nodes[0], 0],
-                    "frame_rate": output_fps,
-                    "loop_count": 0,
-                    "filename_prefix": "hyperframe_video",
-                    "format": "video/h264-mp4",
-                    "pix_fmt": "yuv420p",
-                    "crf": 18,
-                    "save_output": True,
-                    "videopreview": {"hidden": True},
+                    "filename_prefix": "hyperframe",
+                    "fps": output_fps,
+                    "images": [interpolated[0], 0],
                 }
             }
 

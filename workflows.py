@@ -258,60 +258,44 @@ def build_music_video_keyframes(
 
 def build_interpolation_pipeline(
     keyframe_node_ids: list,
+    keyframe_node_ids: list,
     frames_per_transition: int = 12,
     output_fps: int = 24,
     output_prefix: str = "interpolated",
 ) -> dict:
     """
-    Given a sequence of keyframe SaveImage node IDs, build RIFE interpolation
-    between each consecutive pair, then combine into video.
-    
-    Pipeline:
-      For each (keyframe[i], keyframe[i+1]) pair:
-        1. LoadImageBatch (load both frames)
-        2. RIFE_VFI interpolation
-        3. Collect all interpolated frames
-      Final: VHS_VideoCombine → MP4 output
-    
-    This adds nodes to an existing workflow dict.
+    Given a sequence of keyframe SaveImage node IDs, build frame interpolation
+    between each consecutive pair. Returns workflow nodes to add.
     """
     workflow_additions = {}
-    nid = NodeID(start=1000)  # High IDs to avoid conflicts
-
-    interpolated_groups = []
+    nid = NodeID(start=1000)
+    interpolated = []
 
     for i in range(len(keyframe_node_ids) - 1):
-        # RIFE interpolation between consecutive keyframes
+        n_model = nid()
         n_rife = nid()
+        workflow_additions[n_model] = {
+            "class_type": "FrameInterpolationModelLoader",
+            "inputs": {"model_name": "flownet.pkl"}
+        }
         workflow_additions[n_rife] = {
-            "class_type": "RIFE_VFI",
+            "class_type": "FrameInterpolate",
             "inputs": {
-                "ckpt_name": "flownet.pkl",
-                "frames": [keyframe_node_ids[i], 0],
-                "optional_interpolation_states": None,
+                "interp_model": [n_model, 0],
+                "images": [keyframe_node_ids[i], 0],
                 "multiplier": frames_per_transition,
-                "fast_mode": True,
-                "ensemble": True,
-                "scale_factor": 1.0,
             }
         }
-        interpolated_groups.append(n_rife)
+        interpolated.append(n_rife)
 
-    # Combine all interpolated frames into video
-    if interpolated_groups:
-        n_video = nid()
-        workflow_additions[n_video] = {
-            "class_type": "VHS_VideoCombine",
+    if interpolated:
+        n_save = nid()
+        workflow_additions[n_save] = {
+            "class_type": "SaveAnimatedPNG",
             "inputs": {
-                "images": [interpolated_groups[0], 0],
-                "frame_rate": output_fps,
-                "loop_count": 0,
                 "filename_prefix": output_prefix,
-                "format": "video/h264-mp4",
-                "pix_fmt": "yuv420p",
-                "crf": 18,
-                "save_output": True,
-                "videopreview": {"hidden": True},
+                "fps": output_fps,
+                "images": [interpolated[0], 0],
             }
         }
 

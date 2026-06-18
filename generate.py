@@ -94,17 +94,78 @@ def generate(prompt, output_dir="./output", width=1024, height=1024, steps=20, c
         sys.exit(1)
 
 
+def generate_video(prompt, output_dir="./output", width=512, height=512, num_keyframes=4,
+                   frames_per_keyframe=8, output_fps=24, steps=15, seed=None):
+    """Generate video with hyperframes (frame interpolation)."""
+    if seed is None:
+        seed = int(time.time()) % 2**32
+
+    print(f"Submitting video: '{prompt[:60]}' ({num_keyframes} keyframes, {frames_per_keyframe} interp each, {output_fps}fps)")
+
+    resp = post("/generate-video", {
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "num_keyframes": num_keyframes,
+        "frames_per_keyframe": frames_per_keyframe,
+        "output_fps": output_fps,
+        "steps": steps,
+        "seed": seed,
+    })
+
+    if "error" in resp:
+        print(f"Error: {resp['error']}", file=sys.stderr)
+        sys.exit(1)
+
+    prompt_id = resp["prompt_id"]
+    print(f"Accepted. prompt_id={prompt_id}")
+
+    # Poll
+    while True:
+        time.sleep(10)
+        result = get(f"/result/{prompt_id}")
+        status = result.get("status")
+
+        if status == "running":
+            elapsed = result.get("elapsed_seconds", 0)
+            print(f"\r  Running... {elapsed:.0f}s", end="", flush=True)
+            continue
+
+        if status == "done":
+            print(f"\r  Done! Saving to {output_dir}/")
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            for img in result.get("images", []):
+                fn = img["filename"]
+                if "base64" in img:
+                    data = base64.b64decode(img["base64"])
+                    path = out / fn
+                    path.write_bytes(data)
+                    print(f"  {fn} ({len(data)/1024:.0f} KB) -> {path}")
+                elif "error" in img:
+                    print(f"  {fn}: ERROR - {img['error']}")
+            return result
+
+        print(f"Unexpected status: {status}")
+        sys.exit(1)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate images with ComfyUI on Modal")
+    parser = argparse.ArgumentParser(description="Generate images and videos with ComfyUI on Modal")
     parser.add_argument("prompt", nargs="?", default=None)
     parser.add_argument("--output", "-o", default="./output")
     parser.add_argument("--url", default=None, help="Modal app URL")
-    parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--steps", type=int, default=15)
     parser.add_argument("--cfg", type=float, default=7.0)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--list-models", action="store_true")
+    # Video options
+    parser.add_argument("--video", action="store_true", help="Generate video with hyperframes")
+    parser.add_argument("--keyframes", type=int, default=4, help="Number of keyframes (video mode)")
+    parser.add_argument("--interp", type=int, default=8, help="Interpolated frames per keyframe pair")
+    parser.add_argument("--fps", type=int, default=24, help="Output video FPS")
 
     args = parser.parse_args()
     if args.url:
@@ -123,7 +184,11 @@ def main():
     if not args.prompt:
         parser.error("Please provide a prompt or use --list-models")
 
-    generate(args.prompt, args.output, args.width, args.height, args.steps, args.cfg, args.seed)
+    if args.video:
+        generate_video(args.prompt, args.output, args.width, args.height,
+                       args.keyframes, args.interp, args.fps, args.steps, args.seed)
+    else:
+        generate(args.prompt, args.output, args.width, args.height, args.steps, args.cfg, args.seed)
 
 
 if __name__ == "__main__":

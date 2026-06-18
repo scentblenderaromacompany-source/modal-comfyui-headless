@@ -93,8 +93,21 @@ image = (
     .apt_install("git", "git-lfs", "libgl1-mesa-dev", "libglib2.0-0", "libsm6",
                  "libxrender1", "libxext6", "ffmpeg")
     .pip_install("comfy-cli>=1.3.0", "httpx>=0.27.0", "starlette>=0.38.0")
-    .run_commands("comfy --skip-prompt install --nvidia")
-    .run_commands("git lfs install")
+    .run_commands(
+        "comfy --skip-prompt install --nvidia",
+        "git lfs install",
+        # Install frame interpolation nodes (each step separate for error isolation)
+        "cd /root/comfy/ComfyUI/custom_nodes || true",
+        "git clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git 2>/dev/null || echo 'Frame-Interpolation already exists'",
+        "cd /root/comfy/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation && pip install -r requirements.txt --quiet || true",
+        # Install Video Helper Suite
+        "cd /root/comfy/ComfyUI/custom_nodes",
+        "git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git 2>/dev/null || echo 'VHS already exists'",
+        "cd /root/comfy/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite && pip install -r requirements.txt --quiet || true",
+        # Download RIFE model
+        "mkdir -p /root/comfy/ComfyUI/models/rife",
+        "cd /root/comfy/ComfyUI/models/rife && wget -q --timeout=30 https://huggingface.co/datasets/nicolai256/RIFE_checkpoints/resolve/main/flownet.pkl || echo 'RIFE model download failed, will use fallback'",
+    )
 )
 
 # ---------------------------------------------------------------------------
@@ -312,6 +325,144 @@ def serve():
             "settings": info.get("settings", {}),
         })
 
+    async def generate_video(request):
+        """
+        Generate video with hyperframes (frame interpolation).
+        
+        POST /generate-video
+        Body: {
+            "prompt": "a beautiful landscape transforming from day to night",
+            "width": 512,
+            "height": 512,
+            "num_keyframes": 4,           // Number of keyframes to generate
+            "frames_per_keyframe": 8,     // Interpolated frames between each pair
+            "output_fps": 24,
+            "steps": 15,                  // Steps per keyframe
+            "seed": 42
+        }
+        
+        Returns: {prompt_id, status: "accepted", poll_url: "/result/{id}"}
+        """
+        if not comfy_ready.is_set():
+            return JSONResponse({"error": "ComfyUI not ready"}, status_code=503)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+        prompt = body.get("prompt", "a beautiful landscape")
+        width = body.get("width", 512)
+        height = body.get("height", 512)
+        num_keyframes = body.get("num_keyframes", 4)
+        frames_per_keyframe = body.get("frames_per_keyframe", 8)
+        output_fps = body.get("output_fps", 24)
+        steps = body.get("steps", 15)
+        seed = body.get("seed", 42)
+
+        # Build hyperframes workflow
+        # 1. Generate keyframes with FLUX
+        # 2. Interpolate between them with RIFE
+        # 3. Combine into video with VHS
+        workflow = {}
+        node_id = 0
+
+        def nid():
+            nonlocal node_id
+            node_id += 1
+            return str(node_id)
+
+        # Shared model loaders
+        n_unet = nid()
+        n_vae = nid()
+        n_clip = nid()
+        workflow[n_unet] = {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}}
+        workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
+        workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
+
+        keyframe_save_nodes = []
+
+        # Generate keyframes
+        for i in range(num_keyframes):
+            n_text = nid()
+            n_latent = nid()
+            n_sampler = nid()
+            n_decode = nid()
+            n_save = nid()
+
+            frame_prompt = f"{prompt}, frame {i+1} of {num_keyframes}"
+            workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": frame_prompt, "clip": [n_clip, 0]}}
+            workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+            workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
+            workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
+            workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
+            keyframe_save_nodes.append(n_save)
+
+        # RIFE interpolation between consecutive keyframes
+        interpolated_nodes = []
+        for i in range(len(keyframe_save_nodes) - 1):
+            n_rife = nid()
+            workflow[n_rife] = {
+                "class_type": "RIFE_VFI",
+                "inputs": {
+                    "ckpt_name": "flownet.pkl",
+                    "frames": [keyframe_save_nodes[i], 0],
+                    "optional_interpolation_states": None,
+                    "multiplier": frames_per_keyframe,
+                    "fast_mode": True,
+                    "ensemble": True,
+                    "scale_factor": 1.0,
+                }
+            }
+            interpolated_nodes.append(n_rife)
+
+        # Combine into video
+        if interpolated_nodes:
+            n_video = nid()
+            workflow[n_video] = {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "images": [interpolated_nodes[0], 0],
+                    "frame_rate": output_fps,
+                    "loop_count": 0,
+                    "filename_prefix": "hyperframe_video",
+                    "format": "video/h264-mp4",
+                    "pix_fmt": "yuv420p",
+                    "crf": 18,
+                    "save_output": True,
+                    "videopreview": {"hidden": True},
+                }
+            }
+
+        # Submit to ComfyUI
+        client_id = str(uuid.uuid4())
+        payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
+        code, resp_body, _ = _comfy_request(comfy_base, "POST", "/prompt", data=payload, timeout=30)
+
+        if code != 200:
+            return JSONResponse({"error": f"ComfyUI error {code}: {resp_body.decode()[:300]}"}, status_code=500)
+
+        result = json.loads(resp_body)
+        prompt_id = result.get("prompt_id")
+        if not prompt_id:
+            return JSONResponse({"error": f"No prompt_id: {result}"}, status_code=500)
+
+        with results_lock:
+            results_store[prompt_id] = {
+                "status": "running",
+                "images": [],
+                "submitted_at": time.time(),
+                "prompt": prompt,
+                "settings": {"width": width, "height": height, "num_keyframes": num_keyframes,
+                             "frames_per_keyframe": frames_per_keyframe, "output_fps": output_fps},
+            }
+
+        return JSONResponse({
+            "status": "accepted",
+            "prompt_id": prompt_id,
+            "poll_url": f"/result/{prompt_id}",
+        })
+
     async def list_models(request):
         if not comfy_ready.is_set():
             return JSONResponse({"error": "ComfyUI not ready"}, status_code=503)
@@ -346,6 +497,7 @@ def serve():
 
     starlette_app = Starlette(routes=[
         Route("/generate", generate, methods=["POST"]),
+        Route("/generate-video", generate_video, methods=["POST"]),
         Route("/result/{id}", get_result),
         Route("/models", list_models),
         Route("/{path:path}", proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]),

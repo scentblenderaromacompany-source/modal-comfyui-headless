@@ -1,24 +1,15 @@
 """
-Production Workflow Engine for Content Generation
-==================================================
+Production Channel Configurations for Content Generation
+=========================================================
 
-Channel-based workflow system for automated video/image generation.
-
-Channels:
-  youtube-trap     — YouTube rap/trap music videos (16:9, 1080p/4K, high quality)
-  youtube-lofi     — Lo-fi hip hop visualizers (16:9, ambient)
-  tiktok           — TikTok/Reels vertical (9:16, 1080×1920, fast generation)
-  instagram        — Instagram posts/stories (1:1 or 4:5)
-  twitter          — Twitter/X header/media (16:9, compressed)
-  album-art        — Album cover art (1:1, 3000×3000)
-
-Each channel defines:
+Each channel defines a complete generation pipeline:
   - Resolution, aspect ratio, FPS
   - Model selection (transformer, VAE, text encoder)
-  - LoRA presets
+  - LoRA presets with strengths
   - Generation parameters (steps, CFG, sampler)
   - Post-processing (upscale, interpolate, encode)
   - Output format and quality settings
+  - Prompt templates and negative prompts
 """
 
 from dataclasses import dataclass, field
@@ -40,7 +31,7 @@ class ChannelConfig:
     transformer: str = "flux2_dev_fp8mixed.safetensors"
     text_encoder: str = "mistral_3_small_flux2_bf16.safetensors"
     vae: str = "flux2-vae.safetensors"
-    loras: list = field(default_factory=list)
+    loras: list = field(default_factory=list)  # [(name, strength), ...]
     lora_strength: float = 0.8
     num_keyframes: int = 4
     frames_per_keyframe: int = 8
@@ -48,12 +39,15 @@ class ChannelConfig:
     upscale_factor: float = 1.5
     denoise: float = 1.0
     output_format: str = "png"  # png, mp4, webm
-    crf: int = 18  # video quality (lower = better)
-    seed: int = -1  # -1 = random
+    crf: int = 18
+    seed: int = -1
+    negative_prompt: str = ""
+    prompt_prefix: str = ""
+    prompt_suffix: str = ""
 
 
 # ============================================================================
-# CHANNEL DEFINITIONS
+# YOUTUBE RAP/TRAP MUSIC VIDEO CHANNEL
 # ============================================================================
 
 CHANNELS = {
@@ -65,16 +59,26 @@ CHANNELS = {
         fps=24,
         steps=25,
         cfg=7.5,
+        sampler="euler",
+        scheduler="normal",
         transformer="flux2_dev_fp8mixed.safetensors",
         text_encoder="mistral_3_small_flux2_bf16.safetensors",
         vae="flux2-vae.safetensors",
-        loras=[],  # Add trap-specific LoRAs here
+        loras=[
+            # Add LoRAs as they become available in the volume
+            # ("dever_arcane_flux2_klein_9b.safetensors", 0.6),
+            # ("dever_clothes_line_flux2_klein_9b.safetensors", 0.4),
+        ],
         lora_strength=0.75,
         num_keyframes=6,
         frames_per_keyframe=12,
         upscale=False,
+        denoise=1.0,
         output_format="mp4",
         crf=18,
+        negative_prompt="blurry, low quality, distorted, washed out, ugly, deformed, bad anatomy, watermark, text, logo, bright, cheerful, happy, soft, pastel",
+        prompt_prefix="cinematic, dark aesthetic, high contrast, professional music video, 8k detail, ",
+        prompt_suffix=", dramatic lighting, volumetric fog, ray tracing, film grain, anamorphic lens",
     ),
 
     "youtube-lofi": ChannelConfig(
@@ -95,6 +99,9 @@ CHANNELS = {
         upscale=False,
         output_format="mp4",
         crf=20,
+        negative_prompt="blurry, low quality, distorted, harsh, dark, violent, text, watermark",
+        prompt_prefix="lo-fi aesthetic, warm tones, cozy, ambient, anime style, ",
+        prompt_suffix=", soft lighting, film grain, nostalgic, dreamy, bokeh",
     ),
 
     "tiktok": ChannelConfig(
@@ -115,6 +122,9 @@ CHANNELS = {
         upscale=False,
         output_format="mp4",
         crf=22,
+        negative_prompt="blurry, low quality, distorted, text, watermark, boring, static",
+        prompt_prefix="trending, viral aesthetic, eye-catching, dynamic, ",
+        prompt_suffix=", vibrant colors, smooth motion, cinematic transition",
     ),
 
     "instagram": ChannelConfig(
@@ -135,6 +145,9 @@ CHANNELS = {
         upscale=False,
         output_format="mp4",
         crf=20,
+        negative_prompt="blurry, low quality, distorted, text, watermark",
+        prompt_prefix="instagram-worthy, aesthetic, curated, professional, ",
+        prompt_suffix=", clean composition, balanced colors, high detail",
     ),
 
     "album-art": ChannelConfig(
@@ -155,6 +168,9 @@ CHANNELS = {
         upscale=False,
         output_format="png",
         crf=18,
+        negative_prompt="blurry, low quality, distorted, text, watermark, low resolution, pixelated",
+        prompt_prefix="album cover art, professional, high detail, print quality, ",
+        prompt_suffix=", centered composition, bold typography space, dramatic lighting, 8k",
     ),
 
     "twitter": ChannelConfig(
@@ -175,6 +191,9 @@ CHANNELS = {
         upscale=False,
         output_format="mp4",
         crf=24,
+        negative_prompt="blurry, low quality, distorted, text, watermark",
+        prompt_prefix="social media, eye-catching, bold, ",
+        prompt_suffix=", high contrast, compressed, web-optimized",
     ),
 }
 
@@ -190,3 +209,9 @@ def get_channel(name: str) -> ChannelConfig:
 def list_channels() -> dict:
     """List all available channels with descriptions."""
     return {name: cfg.description for name, cfg in CHANNELS.items()}
+
+
+def build_prompt(channel: str, user_prompt: str) -> str:
+    """Build a full prompt from channel template + user prompt."""
+    cfg = get_channel(channel)
+    return f"{cfg.prompt_prefix}{user_prompt}{cfg.prompt_suffix}"

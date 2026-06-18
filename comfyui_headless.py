@@ -234,10 +234,69 @@ def serve():
 
     threading.Thread(target=_poll_worker, daemon=True).start()
 
-    # ---- Endpoints ----
+    # ---- Fallback inline workflow builders ----
+
+    class _NodeID:
+        def __init__(self, start=1):
+            self._counter = start - 1
+        def __call__(self):
+            self._counter += 1
+            return str(self._counter)
+
+    def _build_flux_workflow(prompt, width, height, steps, cfg, seed, loras):
+        """Fallback inline FLUX image workflow."""
+        workflow = {}
+        nid = _NodeID()
+        n_unet = nid(); n_vae = nid(); n_clip = nid()
+        workflow[n_unet] = {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}}
+        workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
+        workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
+        model_out, clip_out = n_unet, n_clip
+        if loras:
+            for ln, ls in loras:
+                n_lora = nid()
+                workflow[n_lora] = {"class_type": "LoraLoader", "inputs": {"lora_name": ln, "strength_model": ls, "strength_clip": ls, "model": [model_out, 0], "clip": [clip_out, 0]}}
+                model_out, clip_out = n_lora, n_lora
+        n_text = nid(); workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [clip_out, 0]}}
+        n_latent = nid(); workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+        n_sampler = nid(); workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [model_out, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
+        n_decode = nid(); workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
+        n_save = nid(); workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": "flux"}}
+        return workflow
+
+    def _build_video_workflow(prompt, width, height, num_keyframes, frames_per_keyframe, output_fps, steps, seed, loras):
+        """Fallback inline hyperframes video workflow."""
+        workflow = {}
+        nid = _NodeID()
+        n_unet = nid(); n_vae = nid(); n_clip = nid()
+        workflow[n_unet] = {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}}
+        workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
+        workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
+        model_out, clip_out = n_unet, n_clip
+        if loras:
+            for ln, ls in loras:
+                n_lora = nid()
+                workflow[n_lora] = {"class_type": "LoraLoader", "inputs": {"lora_name": ln, "strength_model": ls, "strength_clip": ls, "model": [model_out, 0], "clip": [clip_out, 0]}}
+                model_out, clip_out = n_lora, n_lora
+        keyframe_saves = []
+        for i in range(num_keyframes):
+            n_text = nid(); n_latent = nid(); n_sampler = nid(); n_decode = nid(); n_save = nid()
+            workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": f"{prompt}, frame {i+1} of {num_keyframes}", "clip": [clip_out, 0]}}
+            workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+            workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [model_out, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
+            workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
+            workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
+            keyframe_saves.append(n_save)
+        for i in range(len(keyframe_saves) - 1):
+            n_rife = nid()
+            workflow[n_rife] = {"class_type": "RIFE_VFI", "inputs": {"ckpt_name": "flownet.pkl", "frames": [keyframe_saves[i], 0], "multiplier": frames_per_keyframe, "fast_mode": True, "ensemble": True, "scale_factor": 1.0}}
+        if keyframe_saves:
+            n_video = nid()
+            workflow[n_video] = {"class_type": "VHS_VideoCombine", "inputs": {"images": [keyframe_saves[0], 0], "frame_rate": output_fps, "loop_count": 0, "filename_prefix": "hyperframe", "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 18, "save_output": True, "videopreview": {"hidden": True}}}
+        return workflow
 
     async def generate(request):
-        """Submit a generation. Returns {prompt_id, status: 'accepted'} immediately."""
+        """Submit image generation. Returns {prompt_id, status: 'accepted'} immediately."""
         if not comfy_ready.is_set():
             return JSONResponse({"error": "ComfyUI not ready"}, status_code=503)
 
@@ -252,27 +311,85 @@ def serve():
         steps = body.get("steps", 20)
         cfg = body.get("cfg", 7.0)
         seed = body.get("seed", 42)
+        loras = body.get("loras", [])  # [(name, strength), ...]
 
-        # Build workflow: FLUX.2 dev (single-file) + mistral text encoder
-        workflow = {
-            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}},
-            "2": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
-            "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}},
-            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["3", 0]}},
-            "5": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-            "6": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
-            "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["2", 0]}},
-            "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "flux"}},
-        }
+        # Build workflow using the workflow engine
+        try:
+            from workflows import build_txt2img_flux, GenerationRequest
+            req = GenerationRequest(
+                prompt=prompt, width=width, height=height,
+                steps=steps, cfg=cfg, seed=seed, loras=loras,
+            )
+            workflow = build_txt2img_flux(req)
+        except ImportError:
+            # Fallback to inline workflow if workflows.py not available
+            workflow = _build_flux_workflow(prompt, width, height, steps, cfg, seed, loras)
 
-        client_id = str(uuid.uuid4())
-        payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
+        return await _submit_workflow(workflow, results_store, results_lock)
+
+    async def generate_video(request):
+        """Submit video generation with hyperframes. Returns {prompt_id, status: 'accepted'}."""
+        if not comfy_ready.is_set():
+            return JSONResponse({"error": "ComfyUI not ready"}, status_code=503)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+        prompt = body.get("prompt", "a beautiful landscape")
+        width = body.get("width", 512)
+        height = body.get("height", 512)
+        num_keyframes = body.get("num_keyframes", 4)
+        frames_per_keyframe = body.get("frames_per_keyframe", 8)
+        output_fps = body.get("output_fps", 24)
+        steps = body.get("steps", 15)
+        seed = body.get("seed", 42)
+        loras = body.get("loras", [])
+        channel = body.get("channel")  # Optional channel preset
+
+        # Apply channel preset if specified
+        if channel:
+            try:
+                from channels import get_channel, build_prompt
+                ch = get_channel(channel)
+                width = ch.width
+                height = ch.height
+                steps = ch.steps
+                cfg = ch.cfg
+                loras = ch.loras
+                output_fps = ch.fps
+                num_keyframes = ch.num_keyframes
+                frames_per_keyframe = ch.frames_per_keyframe
+                prompt = build_prompt(channel, prompt)
+            except (ImportError, ValueError) as e:
+                print(f"[generate-video] Channel '{channel}' error: {e}, using defaults")
+
+        # Build video workflow
+        try:
+            from workflows import build_txt2video_hyperframes, GenerationRequest
+            req = GenerationRequest(
+                prompt=prompt, width=width, height=height,
+                steps=steps, cfg=cfg, seed=seed, loras=loras,
+            )
+            workflow = build_txt2video_hyperframes(req, num_keyframes, frames_per_keyframe, output_fps)
+        except ImportError:
+            workflow = _build_video_workflow(prompt, width, height, num_keyframes, frames_per_keyframe, output_fps, steps, seed, loras)
+
+        return await _submit_workflow(workflow, results_store, results_lock)
+
+    async def _submit_workflow(workflow, results_store, results_lock):
+        """Submit a workflow to ComfyUI and track it."""
+        import json as _json
+        import uuid as _uuid
+        client_id = str(_uuid.uuid4())
+        payload = _json.dumps({"prompt": workflow, "client_id": client_id}).encode()
         code, resp_body, _ = _comfy_request(comfy_base, "POST", "/prompt", data=payload, timeout=30)
 
         if code != 200:
             return JSONResponse({"error": f"ComfyUI error {code}: {resp_body.decode()[:300]}"}, status_code=500)
 
-        result = json.loads(resp_body)
+        result = _json.loads(resp_body)
         prompt_id = result.get("prompt_id")
         if not prompt_id:
             return JSONResponse({"error": f"No prompt_id: {result}"}, status_code=500)
@@ -282,8 +399,6 @@ def serve():
                 "status": "running",
                 "images": [],
                 "submitted_at": time.time(),
-                "prompt": prompt,
-                "settings": {"width": width, "height": height, "steps": steps, "cfg": cfg, "seed": seed},
             }
 
         return JSONResponse({

@@ -1,60 +1,80 @@
 """
-Advanced Multi-Node Workflow Engine
-====================================
+Production Music Video Visualizer Workflows
+============================================
 
-Production-grade workflows that chain multiple models, LoRAs, and post-processing
-steps to generate high-quality content.
+Advanced workflows that chain multiple models, LoRAs, and post-processing
+steps to generate high-quality music video content for YouTube rap/trap channels.
 
-Workflows:
-  1. txt2img-flux          — Single image generation with FLUX
-  2. txt2video-hyperframes — Keyframe generation + RIFE interpolation
-  3. img2img-refine        — Image refinement with img2img + upscale
-  4. style-transfer        — Apply style reference via IP-Adapter
-  5. music-visualizer      — Audio-reactive video generation
-  6. batch-generate        — Batch process multiple prompts
+Workflow Architecture:
+  Input (prompt/audio) → Keyframe Generation → Style Transfer → Frame Interpolation → Upscale → Encode
+
+Each workflow is a ComfyUI graph with 10-50+ nodes.
 """
 
-from dataclasses import dataclass
 import json
 import time
-import uuid
 
 
-@dataclass
-class GenerationRequest:
-    """A single generation request."""
-    prompt: str
-    negative_prompt: str = "blurry, low quality, distorted, washed out, ugly, deformed"
-    width: int = 1024
-    height: int = 1024
-    steps: int = 20
-    cfg: float = 7.0
-    seed: int = -1
-    loras: list = None  # [(name, strength), ...]
-    workflow: str = "txt2img-flux"  # Which workflow to use
-
-    def __post_init__(self):
-        if self.seed == -1:
-            self.seed = int(time.time()) % 2**32
-        if self.loras is None:
-            self.loras = []
+class NodeID:
+    """Generates sequential node IDs for workflow JSON."""
+    def __init__(self, start=1):
+        self._counter = start - 1
+    def __call__(self):
+        self._counter += 1
+        return str(self._counter)
+    @property
+    def current(self):
+        return str(self._counter)
 
 
 # ============================================================================
-# WORKFLOW BUILDERS
+# WORKFLOW 1: Music Video Keyframe Generator
 # ============================================================================
 
-def build_txt2img_flux(req: GenerationRequest) -> dict:
+def build_music_video_keyframes(
+    prompts: list[str],
+    width: int = 1920,
+    height: int = 1080,
+    steps: int = 25,
+    cfg: float = 7.5,
+    base_seed: int = 42,
+    loras: list = None,
+    style_reference: str = None,
+    controlnet_image: str = None,
+    controlnet_type: str = "openpose",  # openpose, depth, canny
+    controlnet_strength: float = 0.8,
+) -> dict:
     """
-    Single image generation workflow using FLUX.2 dev.
+    Generate a sequence of keyframe images for a music video.
     
-    Pipeline:
-      UNETLoader → VAELoader → CLIPLoader → CLIPTextEncode → EmptyLatent → KSampler → VAEDecode → SaveImage
+    Pipeline per keyframe:
+      1. Load transformer (FLUX.2 dev) + text encoder + VAE
+      2. Apply LoRAs for style
+      3. Encode prompt → CLIPTextEncode
+      4. Optional: ControlNet preprocessing (pose/depth from reference)
+      5. Optional: IP-Adapter style transfer from reference image
+      6. KSampler with schedule (high denoise for first frame, lower for continuity)
+      7. VAEDecode → SaveImage
+    
+    Args:
+        prompts: List of prompts (one per keyframe). Each describes a scene.
+        width/height: Output resolution (1920x1080 for YouTube)
+        steps: Sampling steps per keyframe
+        cfg: CFG scale
+        base_seed: Starting seed (incremented per keyframe)
+        loras: List of (filename, strength) tuples
+        style_reference: Path to style reference image for IP-Adapter
+        controlnet_image: Path to control image for ControlNet
+        controlnet_type: Type of control (openpose, depth, canny)
+        controlnet_strength: ControlNet conditioning strength
+    
+    Returns:
+        ComfyUI workflow JSON dict
     """
     workflow = {}
-    nid = _NodeID()
+    nid = NodeID()
 
-    # Model loaders
+    # ── Shared Model Loaders ──
     n_unet = nid()
     n_vae = nid()
     n_clip = nid()
@@ -72,11 +92,11 @@ def build_txt2img_flux(req: GenerationRequest) -> dict:
         "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}
     }
 
-    # Optional LoRAs
+    # ── LoRA Chain ──
     model_out = n_unet
     clip_out = n_clip
-    if req.loras:
-        for lora_name, lora_strength in req.loras:
+    if loras:
+        for lora_name, lora_strength in loras:
             n_lora = nid()
             workflow[n_lora] = {
                 "class_type": "LoraLoader",
@@ -91,119 +111,202 @@ def build_txt2img_flux(req: GenerationRequest) -> dict:
             model_out = n_lora
             clip_out = n_lora
 
-    # Text encoding
-    n_text = nid()
-    workflow[n_text] = {
-        "class_type": "CLIPTextEncode",
-        "inputs": {"text": req.prompt, "clip": [clip_out, 0]}
-    }
+    # ── IP-Adapter Style Transfer (optional) ──
+    if style_reference:
+        n_ipadapter = nid()
+        n_clip_vision = nid()
+        n_ip_encode = nid()
+        n_apply_ip = nid()
 
-    # Latent
-    n_latent = nid()
-    workflow[n_latent] = {
-        "class_type": "EmptyFlux2LatentImage",
-        "inputs": {"width": req.width, "height": req.height, "batch_size": 1}
-    }
-
-    # Sampler
-    n_sampler = nid()
-    workflow[n_sampler] = {
-        "class_type": "KSampler",
-        "inputs": {
-            "seed": req.seed,
-            "steps": req.steps,
-            "cfg": req.cfg,
-            "sampler_name": "euler",
-            "scheduler": "normal",
-            "denoise": req.denoise if hasattr(req, 'denoise') else 1.0,
-            "model": [model_out, 0],
-            "positive": [n_text, 0],
-            "negative": [n_text, 0],
-            "latent_image": [n_latent, 0],
+        workflow[n_ipadapter] = {
+            "class_type": "IPAdapterModelLoader",
+            "inputs": {"ipadapter_file": "ip-adapter-plus-face_sd15.bin"}
         }
-    }
+        workflow[n_clip_vision] = {
+            "class_type": "CLIPVisionLoader",
+            "inputs": {"clip_name": "clip_vision_h.safetensors"}
+        }
+        workflow[n_ip_encode] = {
+            "class_type": "IPAdapterEncoder",
+            "inputs": {
+                "clip_vision": [n_clip_vision, 0],
+                "image": style_reference,
+                "weight": 0.6,
+            }
+        }
+        workflow[n_apply_ip] = {
+            "class_type": "IPAdapterApply",
+            "inputs": {
+                "ipadapter": [n_ipadapter, 0],
+                "clip_vision": [n_clip_vision, 0],
+                "image": style_reference,
+                "model": [model_out, 0],
+                "weight": 0.6,
+                "weight_type": "original",
+                "start_at": 0.0,
+                "end_at": 1.0,
+                "insightface": None,
+            }
+        }
+        # Update model output to go through IP-Adapter
+        model_out = n_apply_ip
 
-    # Decode & save
-    n_decode = nid()
-    workflow[n_decode] = {
-        "class_type": "VAEDecode",
-        "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}
-    }
-    n_save = nid()
-    workflow[n_save] = {
-        "class_type": "SaveImage",
-        "inputs": {"images": [n_decode, 0], "filename_prefix": "flux"},
-    }
+    # ── ControlNet (optional) ──
+    control_out = None
+    if controlnet_image:
+        n_controlnet = nid()
+        n_preprocessor = nid()
+        n_apply_control = nid()
 
-    return workflow
+        control_model_map = {
+            "openpose": "control_v11p_sd15_openpose.pth",
+            "depth": "control_v11f1p_sd15_depth.pth",
+            "canny": "control_v11p_sd15_canny.pth",
+        }
+        preprocessor_map = {
+            "openpose": "OpenPosePreprocessor",
+            "depth": "DepthPreprocessor",
+            "canny": "CannyPreprocessor",
+        }
 
+        workflow[n_controlnet] = {
+            "class_type": "ControlNetLoader",
+            "inputs": {"control_net_name": control_model_map.get(controlnet_type, "control_v11p_sd15_openpose.pth")}
+        }
+        workflow[n_preprocessor] = {
+            "class_type": preprocessor_map.get(controlnet_type, "OpenPosePreprocessor"),
+            "inputs": {"image": controlnet_image, "resolution": 512}
+        }
+        workflow[n_apply_control] = {
+            "class_type": "ControlNetApply",
+            "inputs": {
+                "conditioning": [clip_out, 0],
+                "control_net": [n_controlnet, 0],
+                "image": [n_preprocessor, 0],
+                "strength": controlnet_strength,
+            }
+        }
+        control_out = n_apply_control
 
-def build_txt2video_hyperframes(req: GenerationRequest, num_keyframes: int = 4,
-                                 frames_per_keyframe: int = 8, output_fps: int = 24) -> dict:
-    """
-    Text-to-video with hyperframes interpolation.
-    
-    Pipeline:
-      1. Generate N keyframes with FLUX (different seeds)
-      2. RIFE interpolate between consecutive keyframes
-      3. VHS combine into MP4
-    """
-    workflow = {}
-    nid = _NodeID()
-
-    # Shared model loaders
-    n_unet = nid()
-    n_vae = nid()
-    n_clip = nid()
-    workflow[n_unet] = {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}}
-    workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
-    workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
-
-    # Generate keyframes
+    # ── Generate Keyframes ──
     keyframe_saves = []
-    for i in range(num_keyframes):
-        n_text = nid()
+    for i, prompt in enumerate(prompts):
+        n_text_pos = nid()
+        n_text_neg = nid()
         n_latent = nid()
         n_sampler = nid()
         n_decode = nid()
         n_save = nid()
 
-        frame_prompt = f"{req.prompt}, scene {i+1} of {num_keyframes}"
-        workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": frame_prompt, "clip": [n_clip, 0]}}
-        workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": req.width, "height": req.height, "batch_size": 1}}
-        workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": req.seed + i * 1000, "steps": req.steps, "cfg": req.cfg, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
-        workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
-        workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
+        # Positive prompt with timestamp info
+        ts_prompt = f"{prompt}, cinematic, dark aesthetic, high contrast, 8k detail, professional music video"
+
+        workflow[n_text_pos] = {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": ts_prompt, "clip": [clip_out, 0]}
+        }
+        workflow[n_text_neg] = {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "text": "blurry, low quality, distorted, washed out, ugly, deformed, bad anatomy, watermark, text, logo",
+                "clip": [clip_out, 0]
+            }
+        }
+
+        # Latent with slight noise variation for continuity
+        n_seed = base_seed + i * 777  # Large step for variety but deterministic
+        workflow[n_latent] = {
+            "class_type": "EmptyFlux2LatentImage",
+            "inputs": {"width": width, "height": height, "batch_size": 1}
+        }
+
+        # Sampler — use ControlNet conditioning if available
+        positive_in = control_out if control_out else n_text_pos
+        workflow[n_sampler] = {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": n_seed,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1.0,
+                "model": [model_out, 0],
+                "positive": [positive_in, 0] if control_out else [n_text_pos, 0],
+                "negative": [n_text_neg, 0],
+                "latent_image": [n_latent, 0],
+            }
+        }
+
+        workflow[n_decode] = {
+            "class_type": "VAEDecode",
+            "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}
+        }
+
+        workflow[n_save] = {
+            "class_type": "SaveImage",
+            "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}
+        }
         keyframe_saves.append(n_save)
 
-    # RIFE interpolation between keyframes
-    interpolated = []
-    for i in range(len(keyframe_saves) - 1):
+    return workflow
+
+
+# ============================================================================
+# WORKFLOW 2: Frame Interpolation Pipeline
+# ============================================================================
+
+def build_interpolation_pipeline(
+    keyframe_node_ids: list,
+    frames_per_transition: int = 12,
+    output_fps: int = 24,
+    output_prefix: str = "interpolated",
+) -> dict:
+    """
+    Given a sequence of keyframe SaveImage node IDs, build RIFE interpolation
+    between each consecutive pair, then combine into video.
+    
+    Pipeline:
+      For each (keyframe[i], keyframe[i+1]) pair:
+        1. LoadImageBatch (load both frames)
+        2. RIFE_VFI interpolation
+        3. Collect all interpolated frames
+      Final: VHS_VideoCombine → MP4 output
+    
+    This adds nodes to an existing workflow dict.
+    """
+    workflow_additions = {}
+    nid = NodeID(start=1000)  # High IDs to avoid conflicts
+
+    interpolated_groups = []
+
+    for i in range(len(keyframe_node_ids) - 1):
+        # RIFE interpolation between consecutive keyframes
         n_rife = nid()
-        workflow[n_rife] = {
+        workflow_additions[n_rife] = {
             "class_type": "RIFE_VFI",
             "inputs": {
                 "ckpt_name": "flownet.pkl",
-                "frames": [keyframe_saves[i], 0],
+                "frames": [keyframe_node_ids[i], 0],
                 "optional_interpolation_states": None,
-                "multiplier": frames_per_keyframe,
+                "multiplier": frames_per_transition,
                 "fast_mode": True,
                 "ensemble": True,
                 "scale_factor": 1.0,
             }
         }
-        interpolated.append(n_rife)
+        interpolated_groups.append(n_rife)
 
-    # Video output
-    if interpolated:
+    # Combine all interpolated frames into video
+    if interpolated_groups:
         n_video = nid()
-        workflow[n_video] = {
+        workflow_additions[n_video] = {
             "class_type": "VHS_VideoCombine",
             "inputs": {
-                "images": [interpolated[0], 0],
+                "images": [interpolated_groups[0], 0],
                 "frame_rate": output_fps,
                 "loop_count": 0,
-                "filename_prefix": "hyperframe",
+                "filename_prefix": output_prefix,
                 "format": "video/h264-mp4",
                 "pix_fmt": "yuv420p",
                 "crf": 18,
@@ -212,75 +315,297 @@ def build_txt2video_hyperframes(req: GenerationRequest, num_keyframes: int = 4,
             }
         }
 
+    return workflow_additions
+
+
+# ============================================================================
+# WORKFLOW 3: Full Music Video Pipeline
+# ============================================================================
+
+def build_full_music_video(
+    prompts: list[str],
+    width: int = 1920,
+    height: int = 1080,
+    steps: int = 20,
+    cfg: float = 7.5,
+    base_seed: int = 42,
+    loras: list = None,
+    frames_per_transition: int = 12,
+    output_fps: int = 24,
+    upscale: bool = True,
+    upscale_factor: float = 1.5,
+    output_prefix: str = "music_video",
+) -> dict:
+    """
+    Complete music video generation pipeline.
+    
+    Pipeline:
+      1. Generate N keyframes with FLUX (different seeds, LoRAs)
+      2. RIFE interpolate between consecutive keyframes
+      3. Optional: Upscale all frames
+      4. VHS combine into MP4 video
+    
+    Args:
+        prompts: Scene descriptions for each keyframe
+        width/height: Output resolution
+        steps: Sampling steps per keyframe
+        cfg: CFG scale
+        base_seed: Starting seed
+        loras: List of (filename, strength) tuples
+        frames_per_transition: Interpolated frames between each keyframe pair
+        output_fps: Video frame rate
+        upscale: Whether to upscale output
+        upscale_factor: Upscale multiplier
+        output_prefix: Output filename prefix
+    
+    Returns:
+        Complete ComfyUI workflow JSON dict
+    """
+    # Step 1: Generate keyframes
+    workflow = build_music_video_keyframes(
+        prompts=prompts,
+        width=width,
+        height=height,
+        steps=steps,
+        cfg=cfg,
+        base_seed=base_seed,
+        loras=loras,
+    )
+
+    # Find keyframe SaveImage nodes
+    keyframe_saves = [
+        nid for nid, node in workflow.items()
+        if node.get("class_type") == "SaveImage" and "keyframe" in node.get("inputs", {}).get("filename_prefix", "")
+    ]
+
+    if len(keyframe_saves) >= 2:
+        # Step 2: Add interpolation pipeline
+        interp_nodes = build_interpolation_pipeline(
+            keyframe_saves,
+            frames_per_transition,
+            output_fps,
+            output_prefix,
+        )
+        workflow.update(interp_nodes)
+
     return workflow
 
 
-def build_img2img_refine(req: GenerationRequest, strength: float = 0.5) -> dict:
+# ============================================================================
+# WORKFLOW 4: Audio-Reactive Visualizer
+# ============================================================================
+
+def build_audio_reactive_visualizer(
+    audio_path: str,
+    prompt: str,
+    width: int = 1920,
+    height: int = 1080,
+    duration_seconds: int = 30,
+    fps: int = 24,
+    bpm: int = 140,
+    base_seed: int = 42,
+) -> dict:
     """
-    Image refinement: img2img pass with lower denoise for detail enhancement.
+    Audio-reactive music video visualizer.
+    
+    Generates frames that sync to audio beats. Uses BPM to time keyframe
+    transitions, then interpolates between them.
     
     Pipeline:
-      LoadImage → VAEDecode → KSampler (img2img) → VAEDecode → SaveImage
+      1. Analyze audio BPM (external, passed as parameter)
+      2. Generate keyframes at beat intervals
+      3. RIFE interpolate between beats
+      4. VHS combine with audio overlay
+    
+    Args:
+        audio_path: Path to audio file (MP3/WAV)
+        prompt: Base visual prompt
+        width/height: Output resolution
+        duration_seconds: Video duration
+        fps: Output frame rate
+        bpm: Beats per minute (for sync timing)
+        base_seed: Random seed
+    
+    Returns:
+        ComfyUI workflow JSON dict
+    """
+    # Calculate keyframe timing based on BPM
+    beat_interval = 60.0 / bpm  # seconds per beat
+    total_beats = int(duration_seconds / beat_interval)
+    keyframe_interval = max(1, total_beats // 8)  # ~8 keyframes total
+
+    # Generate prompts for each keyframe (evolving scene)
+    prompts = []
+    for i in range(0, total_beats, keyframe_interval):
+        beat_time = i * beat_interval
+        # Evolve the prompt over time
+        if i == 0:
+            scene = f"{prompt}, opening scene, establishing shot, dark atmosphere"
+        elif i < total_beats // 3:
+            scene = f"{prompt}, building energy, neon lights emerging, urban landscape"
+        elif i < 2 * total_beats // 3:
+            scene = f"{prompt}, peak energy, intense colors, dynamic movement, cinematic"
+        else:
+            scene = f"{prompt}, closing scene, fade to dark, atmospheric"
+        prompts.append(scene)
+
+    # Build the full pipeline
+    return build_full_music_video(
+        prompts=prompts,
+        width=width,
+        height=height,
+        steps=15,  # Faster for video
+        cfg=7.0,
+        base_seed=base_seed,
+        frames_per_transition=int(beat_interval * fps),
+        output_fps=fps,
+        output_prefix="audio_reactive",
+    )
+
+
+# ============================================================================
+# WORKFLOW 5: Style Transfer Chain
+# ============================================================================
+
+def build_style_transfer_chain(
+    input_image_b64: str,
+    style_reference_b64: str,
+    prompt: str,
+    width: int = 1920,
+    height: int = 1080,
+    steps: int = 20,
+    cfg: float = 7.0,
+    ipadapter_strength: float = 0.6,
+    controlnet_strength: float = 0.4,
+    base_seed: int = 42,
+) -> dict:
+    """
+    Apply style transfer from a reference image to a generated image.
+    
+    Pipeline:
+      1. Generate base image with FLUX
+      2. IP-Adapter applies style from reference
+      3. ControlNet preserves structure
+      4. Blend original + styled output
+    
+    Useful for: applying album art style to generated frames,
+    maintaining visual consistency across a music video.
     """
     workflow = {}
-    nid = _NodeID()
+    nid = NodeID()
 
-    n_load = nid()
+    # Model loaders
+    n_unet = nid()
     n_vae = nid()
     n_clip = nid()
-    n_unet = nid()
-
-    workflow[n_load] = {"class_type": "LoadImage", "inputs": {"image": ""}}  # Filled at runtime
     workflow[n_unet] = {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}}
     workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
     workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
 
-    # Encode image to latent
-    n_encode = nid()
-    workflow[n_encode] = {"class_type": "VAEEncode", "inputs": {"pixels": [n_load, 0], "vae": [n_vae, 0]}}
-
-    # Text
+    # Text encoding
     n_text = nid()
-    workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": req.prompt, "clip": [n_clip, 0]}}
+    workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n_clip, 0]}}
 
-    # Sampler with lower denoise for refinement
+    # Latent
+    n_latent = nid()
+    workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+
+    # Base generation
     n_sampler = nid()
     workflow[n_sampler] = {
         "class_type": "KSampler",
         "inputs": {
-            "seed": req.seed,
-            "steps": req.steps,
-            "cfg": req.cfg,
-            "sampler_name": "euler",
-            "scheduler": "normal",
-            "denoise": strength,
-            "model": [n_unet, 0],
-            "positive": [n_text, 0],
-            "negative": [n_text, 0],
-            "latent_image": [n_encode, 0],
+            "seed": base_seed, "steps": steps, "cfg": cfg,
+            "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+            "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0],
+            "latent_image": [n_latent, 0],
         }
     }
 
     n_decode = nid()
     workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
 
+    # IP-Adapter style transfer
+    n_ip_model = nid()
+    n_clip_vision = nid()
+    n_apply_ip = nid()
+
+    workflow[n_ip_model] = {"class_type": "IPAdapterModelLoader", "inputs": {"ipadapter_file": "ip-adapter-plus-face_sd15.bin"}}
+    workflow[n_clip_vision] = {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}}
+    workflow[n_apply_ip] = {
+        "class_type": "IPAdapterApply",
+        "inputs": {
+            "ipadapter": [n_ip_model, 0],
+            "clip_vision": [n_clip_vision, 0],
+            "image": style_reference_b64,
+            "model": [n_unet, 0],
+            "weight": ipadapter_strength,
+            "weight_type": "original",
+            "start_at": 0.0,
+            "end_at": 1.0,
+        }
+    }
+
+    # Re-sampler with IP-Adapter applied
+    n_latent2 = nid()
+    workflow[n_latent2] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+
+    n_sampler2 = nid()
+    workflow[n_sampler2] = {
+        "class_type": "KSampler",
+        "inputs": {
+            "seed": base_seed + 1, "steps": steps, "cfg": cfg,
+            "sampler_name": "euler", "scheduler": "normal", "denoise": 0.5,  # Lower denoise for style transfer
+            "model": [n_apply_ip, 0], "positive": [n_text, 0], "negative": [n_text, 0],
+            "latent_image": [n_latent2, 0],
+        }
+    }
+
+    n_decode2 = nid()
+    workflow[n_decode2] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler2, 0], "vae": [n_vae, 0]}}
+
+    # Save styled output
     n_save = nid()
-    workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": "refined"}}
+    workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode2, 0], "filename_prefix": "styled"}}
 
     return workflow
 
 
-def build_batch_workflow(prompts: list[str], width: int = 512, height: int = 512,
-                         steps: int = 15, base_seed: int = 42) -> dict:
+# ============================================================================
+# WORKFLOW 6: Batch Album Art Generator
+# ============================================================================
+
+def build_batch_album_art(
+    prompts: list[str],
+    style_reference: str = None,
+    width: int = 3000,
+    height: int = 3000,
+    steps: int = 30,
+    cfg: float = 7.5,
+    base_seed: int = 42,
+) -> dict:
     """
-    Batch generation: multiple images in one workflow run.
+    Generate multiple album cover art variations in one workflow run.
     
     Pipeline:
-      [UNETLoader → VAELoader → CLIPLoader] × 1
-      [CLIPTextEncode → EmptyLatent → KSampler → VAEDecode → SaveImage] × N
+      For each prompt:
+        1. Generate base image with FLUX
+        2. Optional: Apply style transfer from reference
+        3. Save as high-res PNG
+    
+    Args:
+        prompts: List of album art concepts
+        style_reference: Optional style reference image
+        width/height: Output resolution (3000x3000 for print quality)
+        steps: Sampling steps
+        cfg: CFG scale
+        base_seed: Starting seed
+    
+    Returns:
+        ComfyUI workflow JSON dict
     """
     workflow = {}
-    nid = _NodeID()
+    nid = NodeID()
 
     # Shared loaders
     n_unet = nid()
@@ -290,7 +615,6 @@ def build_batch_workflow(prompts: list[str], width: int = 512, height: int = 512
     workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
     workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
 
-    # Each prompt gets its own generation chain
     for i, prompt in enumerate(prompts):
         n_text = nid()
         n_latent = nid()
@@ -298,61 +622,20 @@ def build_batch_workflow(prompts: list[str], width: int = 512, height: int = 512
         n_decode = nid()
         n_save = nid()
 
-        workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [n_clip, 0]}}
+        album_prompt = f"{prompt}, album cover art, square format, high detail, professional, dark aesthetic, cinematic lighting"
+
+        workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": album_prompt, "clip": [n_clip, 0]}}
         workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
-        workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": base_seed + i, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
+        workflow[n_sampler] = {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": base_seed + i, "steps": steps, "cfg": cfg,
+                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0],
+                "latent_image": [n_latent, 0],
+            }
+        }
         workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
-        workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"batch_{i:03d}"}}
+        workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"album_art_{i:03d}"}}
 
     return workflow
-
-
-class _NodeID:
-    def __init__(self):
-        self._counter = 0
-    def __call__(self):
-        self._counter += 1
-        return str(self._counter)
-
-
-# ============================================================================
-# HIGH-LEVEL API
-# ============================================================================
-
-def create_generation(channel: str, prompt: str, **kwargs) -> dict:
-    """
-    Create a generation workflow from a channel config and prompt.
-    
-    Args:
-        channel: Channel name (youtube-trap, tiktok, etc.)
-        prompt: Text prompt
-        **kwargs: Override any channel settings
-    
-    Returns:
-        ComfyUI workflow JSON dict
-    """
-    from channels import get_channel
-    cfg = get_channel(channel)
-
-    # Apply overrides
-    width = kwargs.get("width", cfg.width)
-    height = kwargs.get("height", cfg.height)
-    steps = kwargs.get("steps", cfg.steps)
-    cfg_val = kwargs.get("cfg", cfg.cfg)
-    seed = kwargs.get("seed", -1)
-
-    req = GenerationRequest(
-        prompt=prompt,
-        width=width,
-        height=height,
-        steps=steps,
-        cfg=cfg_val,
-        seed=seed,
-        loras=cfg.loras,
-    )
-
-    # Select workflow based on channel output format
-    if cfg.output_format == "mp4":
-        return build_txt2video_hyperframes(req, cfg.num_keyframes, cfg.frames_per_keyframe, cfg.fps)
-    else:
-        return build_txt2img_flux(req)

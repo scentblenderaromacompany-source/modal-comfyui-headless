@@ -213,3 +213,46 @@ Typical generation times on A10 GPU:
 - **ComfyUI version:** 0.25.0
 - **Python:** 3.11
 - **Key packages:** comfy-cli, starlette, httpx
+
+## Hyperframes (Video Generation)
+
+Hyperframes = generating video by creating keyframes with FLUX, then interpolating between them with RIFE (Real-Time Intermediate Flow Estimation).
+
+### How it works:
+1. Generate N keyframes using FLUX with different seeds
+2. Use RIFE interpolation to generate intermediate frames between each keyframe pair
+3. Combine all frames into MP4 video using Video Helper Suite (VHS)
+
+### Usage:
+```bash
+# Generate video with hyperframes
+python generate.py "a landscape transforming from day to night" --video --keyframes 4 --interp 8 --fps 24 --width 512 --height 512 --steps 15
+
+# Options:
+#   --video           Enable video mode
+#   --keyframes N     Number of keyframes (default: 4)
+#   --interp N        Interpolated frames per keyframe pair (default: 8)
+#   --fps N           Output video FPS (default: 24)
+```
+
+### API:
+```bash
+curl -X POST "$MODAL_URL/generate-video" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "...", "width": 512, "height": 512, "num_keyframes": 4, "frames_per_keyframe": 8, "output_fps": 24, "steps": 15, "seed": 42}'
+# Returns: {prompt_id, status: "accepted", poll_url: "/result/{id}"}
+```
+
+### Custom nodes installed:
+- `ComfyUI-Frame-Interpolation` (RIFE_VFI node) — frame interpolation
+- `ComfyUI-VideoHelperSuite` (VHS_VideoCombine node) — MP4 output
+- RIFE model: `flownet.pkl` in `models/rife/`
+
+### Performance:
+- 4 keyframes × 8 interpolated frames = 32 total frames
+- ~15s per keyframe generation + ~30s interpolation
+- Total: ~2-3 min for a 32-frame video at 512×512
+
+### Files:
+- `hyperframes.py` — Workflow builder for txt2video + interpolation
+- Integrated into `comfyui_headless.py` via `/generate-video` endpoint

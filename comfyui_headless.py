@@ -177,37 +177,20 @@ def serve():
                         os.symlink(f, target)
     print(f"[Models] Linked {linked_count} dirs, LoRAs flattened")
 
-    # ---- Download RIFE frame interpolation model (optional) ----
-    # RIFE model URLs are unreliable. Frame interpolation is optional.
-    # Video generation works without it — frames are generated directly.
-    try:
-        rife_dir = COMFYUI_DIR / "models" / "frame_interpolation"
-        rife_dir.mkdir(parents=True, exist_ok=True)
-        rife_model = rife_dir / "flownet.pkl"
-        if not rife_model.exists():
-            import urllib.request as _dl
-            urls = [
-                "https://huggingface.co/datasets/nicolai256/RIFE_checkpoints/resolve/main/flownet.pkl",
-            ]
-            for url in urls:
-                try:
-                    req = _dl.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    _dl.urlretrieve(req, str(rife_model))
-                    if rife_model.exists() and rife_model.stat().st_size > 100000:
-                        print(f"[RIFE] Model downloaded ({rife_model.stat().st_size/1024/1024:.1f} MB)")
-                        break
-                    else:
-                        rife_model.unlink(missing_ok=True)
-                except Exception as e:
-                    print(f"[RIFE] Failed: {e}")
-            else:
-                print("[RIFE] Model not available — video will use direct frame generation (no interpolation)")
-        else:
-            print(f"[RIFE] Model present ({rife_model.stat().st_size/1024/1024:.1f} MB)")
-    except Exception as e:
-        print(f"[RIFE] Error: {e}")
+    # ---- RIFE model (optional) ----
+    rife_model_path = MVM_VOL_PATH / "rife" / "flownet.pkl"
+    local_rife_path = COMFYUI_DIR / "models" / "frame_interpolation" / "flownet.pkl"
+    if rife_model_path.exists() and not local_rife_path.exists():
+        local_rife_path.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(str(rife_model_path), str(local_rife_path))
+        print(f"[RIFE] Copied from volume")
+    elif local_rife_path.exists():
+        print(f"[RIFE] Model present")
+    else:
+        print("[RIFE] Model not available — using direct frame generation")
 
-    # ---- Start ComfyUI ----
+    # ---- Fallback inline workflow builders ----
     def _start_comfyui():
         nonlocal startup_error
         try:
@@ -358,8 +341,25 @@ def serve():
 
         return await _submit_workflow(workflow, results_store, results_lock)
 
+    async def _submit_workflow(workflow, results_store, results_lock):
+        """Submit a workflow to ComfyUI and track it."""
+        import json as _json
+        import uuid as _uuid
+        client_id = str(_uuid.uuid4())
+        payload = _json.dumps({"prompt": workflow, "client_id": client_id}).encode()
+        code, resp_body, _ = _comfy_request(comfy_base, "POST", "/prompt", data=payload, timeout=30)
+        if code != 200:
+            return JSONResponse({"error": f"ComfyUI error {code}: {resp_body.decode()[:300]}"}, status_code=500)
+        result = _json.loads(resp_body)
+        prompt_id = result.get("prompt_id")
+        if not prompt_id:
+            return JSONResponse({"error": f"No prompt_id: {result}"}, status_code=500)
+        with results_lock:
+            results_store[prompt_id] = {"status": "running", "images": [], "submitted_at": time.time()}
+        return JSONResponse({"status": "accepted", "prompt_id": prompt_id, "poll_url": f"/result/{prompt_id}"})
+
     async def generate_video(request):
-        """Submit video generation with hyperframes. Returns {prompt_id, status: 'accepted'}."""
+        """Submit video generation. Returns {prompt_id, status: 'accepted'}."""
         if not comfy_ready.is_set():
             return JSONResponse({"error": "ComfyUI not ready"}, status_code=503)
 
@@ -377,69 +377,66 @@ def serve():
         steps = body.get("steps", 15)
         seed = body.get("seed", 42)
         loras = body.get("loras", [])
-        channel = body.get("channel")  # Optional channel preset
+        channel = body.get("channel")
 
-        # Apply channel preset if specified
+        # Apply channel preset
         if channel:
             try:
                 from channels import get_channel, build_prompt
                 ch = get_channel(channel)
-                width = ch.width
-                height = ch.height
-                steps = ch.steps
-                cfg = ch.cfg
+                width, height = ch.width, ch.height
+                steps, cfg_val = ch.steps, ch.cfg
                 loras = ch.loras
                 output_fps = ch.fps
                 num_keyframes = ch.num_keyframes
                 frames_per_keyframe = ch.frames_per_keyframe
                 prompt = build_prompt(channel, prompt)
-            except (ImportError, ValueError) as e:
-                print(f"[generate-video] Channel '{channel}' error: {e}, using defaults")
+            except Exception as e:
+                cfg_val = 7.0
+                print(f"[video] Channel error: {e}")
+        else:
+            cfg_val = 7.0
 
-        # Build video workflow
-        try:
-            from workflows import build_txt2video_hyperframes, GenerationRequest
-            req = GenerationRequest(
-                prompt=prompt, width=width, height=height,
-                steps=steps, cfg=cfg, seed=seed, loras=loras,
-            )
-            workflow = build_txt2video_hyperframes(req, num_keyframes, frames_per_keyframe, output_fps)
-        except ImportError:
-            workflow = _build_video_workflow(prompt, width, height, num_keyframes, frames_per_keyframe, output_fps, steps, seed, loras)
+        # Build workflow: generate keyframes, VHS combines them
+        workflow = {}
+        nid = _NodeID()
+        n_unet = nid(); n_vae = nid(); n_clip = nid()
+        workflow[n_unet] = {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}}
+        workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
+        workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
+
+        vae_decodes = []
+        for i in range(num_keyframes):
+            n_t = nid(); n_lat = nid(); n_sam = nid(); n_dec = nid(); n_save = nid()
+            workflow[n_t] = {"class_type": "CLIPTextEncode", "inputs": {"text": f"{prompt}, scene {i+1} of {num_keyframes}", "clip": [n_clip, 0]}}
+            workflow[n_lat] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+            workflow[n_sam] = {"class_type": "KSampler", "inputs": {"seed": seed + i*1000, "steps": steps, "cfg": cfg_val, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_t, 0], "negative": [n_t, 0], "latent_image": [n_lat, 0]}}
+            workflow[n_dec] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sam, 0], "vae": [n_vae, 0]}}
+            workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_dec, 0], "filename_prefix": f"keyframe_{i:03d}"}}
+            vae_decodes.append(n_dec)
+
+        # VHS Video Combine (if available) or SaveAnimatedPNG fallback
+        if vae_decodes:
+            n_vid = nid()
+            workflow[n_vid] = {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "images": [vae_decodes[0], 0],
+                    "frame_rate": output_fps,
+                    "loop_count": 0,
+                    "filename_prefix": "music_video",
+                    "format": "video/h264-mp4",
+                    "pix_fmt": "yuv420p",
+                    "crf": 18,
+                    "save_output": True,
+                    "videopreview": {"hidden": True},
+                }
+            }
 
         return await _submit_workflow(workflow, results_store, results_lock)
 
-    async def _submit_workflow(workflow, results_store, results_lock):
-        """Submit a workflow to ComfyUI and track it."""
-        import json as _json
-        import uuid as _uuid
-        client_id = str(_uuid.uuid4())
-        payload = _json.dumps({"prompt": workflow, "client_id": client_id}).encode()
-        code, resp_body, _ = _comfy_request(comfy_base, "POST", "/prompt", data=payload, timeout=30)
-
-        if code != 200:
-            return JSONResponse({"error": f"ComfyUI error {code}: {resp_body.decode()[:300]}"}, status_code=500)
-
-        result = _json.loads(resp_body)
-        prompt_id = result.get("prompt_id")
-        if not prompt_id:
-            return JSONResponse({"error": f"No prompt_id: {result}"}, status_code=500)
-
-        with results_lock:
-            results_store[prompt_id] = {
-                "status": "running",
-                "images": [],
-                "submitted_at": time.time(),
-            }
-
-        return JSONResponse({
-            "status": "accepted",
-            "prompt_id": prompt_id,
-            "poll_url": f"/result/{prompt_id}",
-        })
-
     async def get_result(request):
-        """Poll for generation results."""
+        """Poll for generation results. Returns images and/or video files."""
         prompt_id = request.path_params["id"]
         with results_lock:
             info = results_store.get(prompt_id)
@@ -450,8 +447,10 @@ def serve():
             elapsed = round(time.time() - info["submitted_at"], 1)
             return JSONResponse({"status": "running", "elapsed_seconds": elapsed})
 
-        # Done — download images from ComfyUI and return
+        # Done — collect all output files (images + videos)
         output_files = []
+
+        # 1. Download images from ComfyUI history
         for img_info in info.get("images", []):
             view_url = f"/view?filename={img_info['filename']}&subfolder={img_info.get('subfolder', '')}&type={img_info.get('type', 'output')}"
             try:
@@ -464,144 +463,28 @@ def serve():
             except Exception as e:
                 output_files.append({"filename": img_info["filename"], "error": str(e)})
 
+        # 2. Scan output directory for video files
+        output_dir = COMFYUI_DIR / "output"
+        if output_dir.exists():
+            import glob as _glob
+            for ext in ["*.mp4", "*.webm", "*.gif", "*.mov"]:
+                for video_path in _glob.glob(str(output_dir / ext)):
+                    try:
+                        video_data = Path(video_path).read_bytes()
+                        fn = Path(video_path).name
+                        output_files.append({
+                            "filename": fn,
+                            "size_bytes": len(video_data),
+                            "base64": base64.b64encode(video_data).decode(),
+                        })
+                    except Exception:
+                        pass
+
         return JSONResponse({
             "status": "done",
             "prompt_id": prompt_id,
             "images": output_files,
             "settings": info.get("settings", {}),
-        })
-
-    async def generate_video(request):
-        """
-        Generate video with hyperframes (frame interpolation).
-        
-        POST /generate-video
-        Body: {
-            "prompt": "a beautiful landscape transforming from day to night",
-            "width": 512,
-            "height": 512,
-            "num_keyframes": 4,           // Number of keyframes to generate
-            "frames_per_keyframe": 8,     // Interpolated frames between each pair
-            "output_fps": 24,
-            "steps": 15,                  // Steps per keyframe
-            "seed": 42
-        }
-        
-        Returns: {prompt_id, status: "accepted", poll_url: "/result/{id}"}
-        """
-        if not comfy_ready.is_set():
-            return JSONResponse({"error": "ComfyUI not ready"}, status_code=503)
-
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-        prompt = body.get("prompt", "a beautiful landscape")
-        width = body.get("width", 512)
-        height = body.get("height", 512)
-        num_keyframes = body.get("num_keyframes", 4)
-        frames_per_keyframe = body.get("frames_per_keyframe", 8)
-        output_fps = body.get("output_fps", 24)
-        steps = body.get("steps", 15)
-        seed = body.get("seed", 42)
-
-        # Build hyperframes workflow
-        # 1. Generate keyframes with FLUX
-        # 2. Interpolate between them with RIFE
-        # 3. Combine into video with VHS
-        workflow = {}
-        node_id = 0
-
-        def nid():
-            nonlocal node_id
-            node_id += 1
-            return str(node_id)
-
-        # Shared model loaders
-        n_unet = nid()
-        n_vae = nid()
-        n_clip = nid()
-        workflow[n_unet] = {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default"}}
-        workflow[n_vae] = {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}}
-        workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
-
-        keyframe_save_nodes = []
-        vae_decode_nodes = []
-
-        # Generate keyframes
-        for i in range(num_keyframes):
-            n_text = nid()
-            n_latent = nid()
-            n_sampler = nid()
-            n_decode = nid()
-            n_save = nid()
-
-            frame_prompt = f"{prompt}, scene {i+1} of {num_keyframes}"
-            workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": frame_prompt, "clip": [n_clip, 0]}}
-            workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
-            workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
-            workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
-            workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
-            keyframe_save_nodes.append(n_save)
-            vae_decode_nodes.append(n_decode)
-
-        # Frame interpolation (optional, if RIFE model available)
-        rife_available = (COMFYUI_DIR / "models" / "frame_interpolation" / "flownet.pkl").exists()
-        interpolated = []
-        if rife_available:
-            for i in range(len(keyframe_save_nodes) - 1):
-                n_model = nid()
-                n_rife = nid()
-                workflow[n_model] = {"class_type": "FrameInterpolationModelLoader", "inputs": {"model_name": "flownet.pkl"}}
-                workflow[n_rife] = {"class_type": "FrameInterpolate", "inputs": {"interp_model": [n_model, 0], "images": [keyframe_save_nodes[i], 0], "multiplier": frames_per_keyframe}}
-                interpolated.append(n_rife)
-
-        # Video output — use VHS_VideoCombine with VAEDecode output
-        if vae_decode_nodes:
-            n_video = nid()
-            workflow[n_video] = {
-                "class_type": "VHS_VideoCombine",
-                "inputs": {
-                    "images": [vae_decode_nodes[0], 0],
-                    "frame_rate": output_fps,
-                    "loop_count": 0,
-                    "filename_prefix": "music_video",
-                    "format": "video/h264-mp4",
-                    "pix_fmt": "yuv420p",
-                    "crf": 18,
-                    "save_output": True,
-                    "videopreview": {"hidden": True},
-                }
-            }
-
-        # Submit to ComfyUI
-        client_id = str(uuid.uuid4())
-        payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
-        code, resp_body, _ = _comfy_request(comfy_base, "POST", "/prompt", data=payload, timeout=30)
-
-        if code != 200:
-            return JSONResponse({"error": f"ComfyUI error {code}: {resp_body.decode()[:300]}"}, status_code=500)
-
-        result = json.loads(resp_body)
-        prompt_id = result.get("prompt_id")
-        if not prompt_id:
-            return JSONResponse({"error": f"No prompt_id: {result}"}, status_code=500)
-
-        with results_lock:
-            results_store[prompt_id] = {
-                "status": "running",
-                "images": [],
-                "submitted_at": time.time(),
-                "prompt": prompt,
-                "settings": {"width": width, "height": height, "num_keyframes": num_keyframes,
-                             "frames_per_keyframe": frames_per_keyframe, "output_fps": output_fps},
-            }
-
-        return JSONResponse({
-            "status": "accepted",
-            "prompt_id": prompt_id,
-            "poll_url": f"/result/{prompt_id}",
         })
 
     async def list_models(request):

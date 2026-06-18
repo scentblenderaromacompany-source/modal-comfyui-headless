@@ -106,14 +106,8 @@ image = (
         "git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git 2>/dev/null || true",
         "cd /root/comfy/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite && "
         "pip install -r requirements.txt --quiet 2>/dev/null || true",
-        # Download RIFE model to the correct directory for FrameInterpolationModelLoader
-        "mkdir -p /root/comfy/ComfyUI/models/frame_interpolation && "
-        "cd /root/comfy/ComfyUI/models/frame_interpolation && "
-        "wget -q --timeout=60 https://huggingface.co/datasets/nicolai256/RIFE_checkpoints/resolve/main/flownet.pkl || "
-        "wget -q --timeout=60 https://github.com/h94/IP-Adapter/raw/main/models/rife/flownet.pkl || true",
-        # Also download to rife dir for compatibility
-        "mkdir -p /root/comfy/ComfyUI/models/rife && "
-        "cp /root/comfy/ComfyUI/models/frame_interpolation/flownet.pkl /root/comfy/ComfyUI/models/rife/ 2>/dev/null || true",
+        # NOTE: RIFE model (flownet.pkl) is downloaded at container startup
+        # in serve() because the custom node directory must exist first",
     )
 )
 
@@ -182,6 +176,36 @@ def serve():
                     if not target.exists():
                         os.symlink(f, target)
     print(f"[Models] Linked {linked_count} dirs, LoRAs flattened")
+
+    # ---- Download RIFE frame interpolation model (optional) ----
+    # RIFE model URLs are unreliable. Frame interpolation is optional.
+    # Video generation works without it — frames are generated directly.
+    try:
+        rife_dir = COMFYUI_DIR / "models" / "frame_interpolation"
+        rife_dir.mkdir(parents=True, exist_ok=True)
+        rife_model = rife_dir / "flownet.pkl"
+        if not rife_model.exists():
+            import urllib.request as _dl
+            urls = [
+                "https://huggingface.co/datasets/nicolai256/RIFE_checkpoints/resolve/main/flownet.pkl",
+            ]
+            for url in urls:
+                try:
+                    req = _dl.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    _dl.urlretrieve(req, str(rife_model))
+                    if rife_model.exists() and rife_model.stat().st_size > 100000:
+                        print(f"[RIFE] Model downloaded ({rife_model.stat().st_size/1024/1024:.1f} MB)")
+                        break
+                    else:
+                        rife_model.unlink(missing_ok=True)
+                except Exception as e:
+                    print(f"[RIFE] Failed: {e}")
+            else:
+                print("[RIFE] Model not available — video will use direct frame generation (no interpolation)")
+        else:
+            print(f"[RIFE] Model present ({rife_model.stat().st_size/1024/1024:.1f} MB)")
+    except Exception as e:
+        print(f"[RIFE] Error: {e}")
 
     # ---- Start ComfyUI ----
     def _start_comfyui():
@@ -290,7 +314,7 @@ def serve():
             n_text = nid(); n_latent = nid(); n_sampler = nid(); n_decode = nid(); n_save = nid()
             workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": f"{prompt}, frame {i+1} of {num_keyframes}", "clip": [clip_out, 0]}}
             workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
-            workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [model_out, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
+            workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
             workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
             workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
             keyframe_saves.append(n_save)
@@ -503,6 +527,7 @@ def serve():
         workflow[n_clip] = {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors", "type": "flux2"}}
 
         keyframe_save_nodes = []
+        vae_decode_nodes = []
 
         # Generate keyframes
         for i in range(num_keyframes):
@@ -512,42 +537,41 @@ def serve():
             n_decode = nid()
             n_save = nid()
 
-            frame_prompt = f"{prompt}, frame {i+1} of {num_keyframes}"
+            frame_prompt = f"{prompt}, scene {i+1} of {num_keyframes}"
             workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": frame_prompt, "clip": [n_clip, 0]}}
             workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
             workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
             workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
             workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
             keyframe_save_nodes.append(n_save)
+            vae_decode_nodes.append(n_decode)
 
-        # Frame interpolation between consecutive keyframes
+        # Frame interpolation (optional, if RIFE model available)
+        rife_available = (COMFYUI_DIR / "models" / "frame_interpolation" / "flownet.pkl").exists()
         interpolated = []
-        for i in range(len(keyframe_save_nodes) - 1):
-            n_model = nid()
-            n_rife = nid()
-            workflow[n_model] = {
-                "class_type": "FrameInterpolationModelLoader",
-                "inputs": {"model_name": "flownet.pkl"}
-            }
-            workflow[n_rife] = {
-                "class_type": "FrameInterpolate",
-                "inputs": {
-                    "interp_model": [n_model, 0],
-                    "images": [keyframe_save_nodes[i], 0],
-                    "multiplier": frames_per_keyframe,
-                }
-            }
-            interpolated.append(n_rife)
+        if rife_available:
+            for i in range(len(keyframe_save_nodes) - 1):
+                n_model = nid()
+                n_rife = nid()
+                workflow[n_model] = {"class_type": "FrameInterpolationModelLoader", "inputs": {"model_name": "flownet.pkl"}}
+                workflow[n_rife] = {"class_type": "FrameInterpolate", "inputs": {"interp_model": [n_model, 0], "images": [keyframe_save_nodes[i], 0], "multiplier": frames_per_keyframe}}
+                interpolated.append(n_rife)
 
-        # Save output (use SaveAnimatedPNG since VHS may not be available)
-        if interpolated:
-            n_save = nid()
-            workflow[n_save] = {
-                "class_type": "SaveAnimatedPNG",
+        # Video output — use VHS_VideoCombine with VAEDecode output
+        if vae_decode_nodes:
+            n_video = nid()
+            workflow[n_video] = {
+                "class_type": "VHS_VideoCombine",
                 "inputs": {
-                    "filename_prefix": "hyperframe",
-                    "fps": output_fps,
-                    "images": [interpolated[0], 0],
+                    "images": [vae_decode_nodes[0], 0],
+                    "frame_rate": output_fps,
+                    "loop_count": 0,
+                    "filename_prefix": "music_video",
+                    "format": "video/h264-mp4",
+                    "pix_fmt": "yuv420p",
+                    "crf": 18,
+                    "save_output": True,
+                    "videopreview": {"hidden": True},
                 }
             }
 

@@ -190,6 +190,19 @@ def serve():
     else:
         print("[RIFE] Model not available — using direct frame generation")
 
+    # ---- Upscale model (optional) ----
+    upscale_src = MVM_VOL_PATH / "upscale_models" / "4x-UltraSharp.pth"
+    upscale_dst = COMFYUI_DIR / "models" / "upscale_models" / "4x-UltraSharp.pth"
+    if upscale_src.exists() and not upscale_dst.exists():
+        upscale_dst.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(str(upscale_src), str(upscale_dst))
+        print("[Upscale] Copied from volume")
+    elif upscale_dst.exists():
+        print("[Upscale] Model present")
+    else:
+        print("[Upscale] Model not available")
+
     # ---- Fallback inline workflow builders ----
     def _start_comfyui():
         nonlocal startup_error

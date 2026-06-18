@@ -27,7 +27,9 @@ import base64
 import json
 import sys
 import time
+from datetime import datetime, timezone
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 MODAL_URL = "https://robertmcasper--comfyui-headless-serve.modal.run"
@@ -82,6 +84,34 @@ def poll_result(poll_url, timeout=600):
     sys.exit(1)
 
 
+def health_check():
+    """Check Modal/ComfyUI health and print GPU state."""
+    req = urllib.request.Request(f"{MODAL_URL}/system_stats")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read())
+        except Exception:
+            print(f"Not ready: HTTP {e.code}")
+            return False
+    except Exception as e:
+        print(f"Not ready: {e}")
+        return False
+    if "error" in data:
+        print(f"Not ready: {data['error']}")
+        return False
+    device = data.get("devices", [{}])[0]
+    system = data.get("system", {})
+    print("Ready")
+    print(f"  ComfyUI: {system.get('comfyui_version', 'unknown')}")
+    print(f"  GPU: {device.get('name', 'unknown')}")
+    if device.get("vram_free"):
+        print(f"  VRAM free: {device['vram_free'] / 1024**3:.1f} GB")
+    return True
+
+
 def save_images(result, output_dir):
     """Save base64 images from result to disk."""
     out = Path(output_dir)
@@ -100,8 +130,27 @@ def save_images(result, output_dir):
     return saved
 
 
+def save_manifest(result, saved_files, output_dir, request_payload=None):
+    """Write a reproducibility manifest next to outputs."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "modal_url": MODAL_URL,
+        "prompt_id": result.get("prompt_id"),
+        "status": result.get("status"),
+        "request": request_payload or {},
+        "files": saved_files,
+        "settings": result.get("settings", {}),
+    }
+    path = out / f"manifest_{result.get('prompt_id', int(time.time()))}.json"
+    path.write_text(json.dumps(manifest, indent=2))
+    print(f"  manifest -> {path}")
+    return str(path)
+
+
 def generate_image(prompt, channel=None, output_dir="./output", width=None, height=None,
-                   steps=None, cfg=None, seed=None):
+                   steps=None, cfg=None, seed=None, timeout=600):
     """Generate a single image."""
     payload = {"prompt": prompt}
     if width: payload["width"] = width
@@ -109,6 +158,7 @@ def generate_image(prompt, channel=None, output_dir="./output", width=None, heig
     if steps: payload["steps"] = steps
     if cfg: payload["cfg"] = cfg
     if seed: payload["seed"] = seed
+    if channel: payload["channel"] = channel
 
     print(f"Submitting: '{prompt[:70]}'")
     if channel:
@@ -123,13 +173,15 @@ def generate_image(prompt, channel=None, output_dir="./output", width=None, heig
     poll_url = resp["poll_url"]
     print(f"  prompt_id={prompt_id}")
 
-    result = poll_result(poll_url)
+    result = poll_result(poll_url, timeout=timeout)
     print(f"\r  Done! Saving to {output_dir}/")
-    return save_images(result, output_dir)
+    saved = save_images(result, output_dir)
+    save_manifest(result, saved, output_dir, payload)
+    return saved
 
 
 def generate_video(prompt, channel=None, output_dir="./output", width=None, height=None,
-                   steps=None, seed=None, num_keyframes=4, frames_per_keyframe=8, fps=24):
+                   steps=None, seed=None, num_keyframes=4, frames_per_keyframe=8, fps=24, timeout=1200):
     """Generate video with hyperframes."""
     # Try /generate-video endpoint first
     payload = {
@@ -141,6 +193,7 @@ def generate_video(prompt, channel=None, output_dir="./output", width=None, heig
         "output_fps": fps,
         "steps": steps or 15,
         "seed": seed or -1,
+        "channel": channel,
     }
 
     print(f"Submitting video: '{prompt[:70]}' ({num_keyframes} keyframes, {frames_per_keyframe} interp)")
@@ -154,9 +207,11 @@ def generate_video(prompt, channel=None, output_dir="./output", width=None, heig
     poll_url = resp["poll_url"]
     print(f"  prompt_id={prompt_id}")
 
-    result = poll_result(poll_url, timeout=1200)  # 2 min timeout for video
+    result = poll_result(poll_url, timeout=timeout)
     print(f"\r  Done! Saving to {output_dir}/")
-    return save_images(result, output_dir)
+    saved = save_images(result, output_dir)
+    save_manifest(result, saved, output_dir, payload)
+    return saved
 
 
 def main():
@@ -176,12 +231,18 @@ def main():
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--list-channels", action="store_true")
     parser.add_argument("--list-models", action="store_true")
+    parser.add_argument("--health", action="store_true", help="Check Modal/ComfyUI health and exit")
+    parser.add_argument("--timeout", type=int, default=None, help="Polling timeout in seconds")
 
     args = parser.parse_args()
 
     global MODAL_URL
     if args.url:
         MODAL_URL = args.url.rstrip("/")
+
+    if args.health:
+        ok = health_check()
+        sys.exit(0 if ok else 1)
 
     if args.list_channels:
         try:
@@ -210,12 +271,12 @@ def main():
         generate_video(
             args.prompt, args.channel, args.output,
             args.width, args.height, args.steps, args.seed,
-            args.keyframes, args.interp, args.fps,
+            args.keyframes, args.interp, args.fps, args.timeout or 1200,
         )
     else:
         generate_image(
             args.prompt, args.channel, args.output,
-            args.width, args.height, args.steps, args.cfg, args.seed,
+            args.width, args.height, args.steps, args.cfg, args.seed, args.timeout or 600,
         )
 
 

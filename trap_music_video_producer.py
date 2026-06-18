@@ -422,26 +422,26 @@ class TrapMusicVideoProducer:
                     lf.write(f"file '{f}'\n")
                     lf.write(f"duration {1.0/self.style['fps']:.4f}\n")
             
-            ffmpeg_cmd = (
-                f"ffmpeg -y -f concat -safe 0 -i {list_file} "
-                f"-c:v {self.channel['codec']} -crf {self.channel['crf']} "
-                f"-preset {self.channel['preset']} -pix_fmt yuv420p "
-                f"-movflags +faststart "
-            )
-            
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                "-c:v", self.channel["codec"], "-crf", str(self.channel["crf"]),
+                "-preset", self.channel["preset"], "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+            ]
             if audio_path and Path(audio_path).exists():
-                ffmpeg_cmd += (
-                    f"-i {audio_path} -c:a {self.channel['audio_codec']} "
-                    f"-b:a {self.channel['audio_bitrate']} -shortest "
-                )
-            
-            ffmpeg_cmd += video_path
-            
+                ffmpeg_cmd.extend([
+                    "-i", str(audio_path),
+                    "-c:a", self.channel["audio_codec"],
+                    "-b:a", self.channel["audio_bitrate"],
+                    "-shortest",
+                ])
+            ffmpeg_cmd.append(video_path)
+
             print(f"\nEncoding video with FFmpeg...")
-            print(f"  Command: {ffmpeg_cmd[:100]}...")
-            
+            print(f"  Command: {' '.join(ffmpeg_cmd[:12])} ...")
+
             import subprocess
-            result = subprocess.run(ffmpeg_cmd, shell=True, capture_output=True, text=True)
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
             
             if result.returncode == 0 and Path(video_path).exists():
                 size_mb = Path(video_path).stat().st_size / 1024 / 1024

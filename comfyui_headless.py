@@ -240,24 +240,46 @@ def serve():
                 try:
                     _, body, _ = _comfy_request(comfy_base, "GET", f"/history/{prompt_id}", timeout=10)
                     history = json.loads(body)
-                    if prompt_id in history:
-                        data = history[prompt_id]
-                        outputs = data.get("outputs", {})
-                        images = []
-                        for nid, nout in outputs.items():
-                            for img in nout.get("images", []):
-                                images.append({
-                                    "filename": img["filename"],
-                                    "subfolder": img.get("subfolder", ""),
-                                    "type": img.get("type", "output"),
-                                    "node_id": nid,
-                                })
+                    if prompt_id not in history:
+                        continue
+                    data = history[prompt_id]
+                    status = data.get("status", {})
+                    status_str = status.get("status_str")
+                    if status_str == "error":
+                        messages = status.get("messages") or ["Unknown ComfyUI error"]
                         with results_lock:
-                            results_store[prompt_id]["status"] = "done"
-                            results_store[prompt_id]["images"] = images
+                            results_store[prompt_id]["status"] = "error"
+                            results_store[prompt_id]["error"] = messages[0]
                             results_store[prompt_id]["done_at"] = time.time()
-                except Exception:
-                    pass
+                        continue
+                    outputs = data.get("outputs", {})
+                    if not outputs:
+                        continue
+                    images = []
+                    for nid, nout in outputs.items():
+                        for img in nout.get("images", []):
+                            images.append({
+                                "filename": img["filename"],
+                                "subfolder": img.get("subfolder", ""),
+                                "type": img.get("type", "output"),
+                                "node_id": nid,
+                            })
+                    with results_lock:
+                        results_store[prompt_id]["status"] = "done"
+                        results_store[prompt_id]["images"] = images
+                        results_store[prompt_id]["done_at"] = time.time()
+                except Exception as e:
+                    with results_lock:
+                        results_store[prompt_id]["status"] = "error"
+                        results_store[prompt_id]["error"] = str(e)
+                        results_store[prompt_id]["done_at"] = time.time()
+            
+            # Evict old results
+            now = time.time()
+            with results_lock:
+                to_delete = [pid for pid, info in results_store.items() if info.get("done_at") and now - info["done_at"] > 3600]
+                for pid in to_delete:
+                    del results_store[pid]
 
     threading.Thread(target=_poll_worker, daemon=True).start()
 
@@ -284,9 +306,9 @@ def serve():
                 n_lora = nid()
                 workflow[n_lora] = {"class_type": "LoraLoader", "inputs": {"lora_name": ln, "strength_model": ls, "strength_clip": ls, "model": [model_out, 0], "clip": [clip_out, 0]}}
                 model_out, clip_out = n_lora, n_lora
-        n_text = nid(); workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [clip_out, 0]}}
+        n_text = nid(); n_text_neg = nid(); workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": [clip_out, 0]}}; workflow[n_text_neg] = {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, low quality, distorted", "clip": [clip_out, 0]}}
         n_latent = nid(); workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
-        n_sampler = nid(); workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [model_out, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
+        n_sampler = nid(); workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [model_out, 0], "positive": [n_text, 0], "negative": [n_text_neg, 0], "latent_image": [n_latent, 0]}}
         n_decode = nid(); workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
         n_save = nid(); workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": "flux"}}
         return workflow
@@ -307,19 +329,17 @@ def serve():
                 model_out, clip_out = n_lora, n_lora
         keyframe_saves = []
         for i in range(num_keyframes):
-            n_text = nid(); n_latent = nid(); n_sampler = nid(); n_decode = nid(); n_save = nid()
+            n_text = nid(); n_text_neg = nid(); n_latent = nid(); n_sampler = nid(); n_decode = nid(); n_save = nid()
             workflow[n_text] = {"class_type": "CLIPTextEncode", "inputs": {"text": f"{prompt}, frame {i+1} of {num_keyframes}", "clip": [clip_out, 0]}}
+            workflow[n_text_neg] = {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry", "clip": [clip_out, 0]}}
             workflow[n_latent] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
-            workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text, 0], "latent_image": [n_latent, 0]}}
+            workflow[n_sampler] = {"class_type": "KSampler", "inputs": {"seed": seed + i * 1000, "steps": steps, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_text, 0], "negative": [n_text_neg, 0], "latent_image": [n_latent, 0]}}
             workflow[n_decode] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sampler, 0], "vae": [n_vae, 0]}}
             workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_decode, 0], "filename_prefix": f"keyframe_{i:03d}"}}
             keyframe_saves.append(n_save)
-        for i in range(len(keyframe_saves) - 1):
-            n_rife = nid()
-            workflow[n_rife] = {"class_type": "RIFE_VFI", "inputs": {"ckpt_name": "flownet.pkl", "frames": [keyframe_saves[i], 0], "multiplier": frames_per_keyframe, "fast_mode": True, "ensemble": True, "scale_factor": 1.0}}
-        if keyframe_saves:
-            n_video = nid()
-            workflow[n_video] = {"class_type": "VHS_VideoCombine", "inputs": {"images": [keyframe_saves[0], 0], "frame_rate": output_fps, "loop_count": 0, "filename_prefix": "hyperframe", "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 18, "save_output": True, "videopreview": {"hidden": True}}}
+        # Fallback mode intentionally saves keyframes only. Client-side FFmpeg handles
+        # video assembly because VHS outputs are not reliably reported in history and
+        # RIFE requires an optional model file.
         return workflow
 
     async def generate(request):
@@ -420,21 +440,32 @@ def serve():
 
         vae_decodes = []
         for i in range(num_keyframes):
-            n_t = nid(); n_lat = nid(); n_sam = nid(); n_dec = nid(); n_save = nid()
+            n_t = nid(); n_t_neg = nid(); n_lat = nid(); n_sam = nid(); n_dec = nid(); n_save = nid()
             workflow[n_t] = {"class_type": "CLIPTextEncode", "inputs": {"text": f"{prompt}, scene {i+1} of {num_keyframes}", "clip": [n_clip, 0]}}
+            workflow[n_t_neg] = {"class_type": "CLIPTextEncode", "inputs": {"text": body.get("negative_prompt", "blurry, low quality"), "clip": [n_clip, 0]}}
             workflow[n_lat] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
-            workflow[n_sam] = {"class_type": "KSampler", "inputs": {"seed": seed + i*1000, "steps": steps, "cfg": cfg_val, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_t, 0], "negative": [n_t, 0], "latent_image": [n_lat, 0]}}
+            workflow[n_sam] = {"class_type": "KSampler", "inputs": {"seed": seed + i*1000, "steps": steps, "cfg": cfg_val, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": [n_unet, 0], "positive": [n_t, 0], "negative": [n_t_neg, 0], "latent_image": [n_lat, 0]}}
             workflow[n_dec] = {"class_type": "VAEDecode", "inputs": {"samples": [n_sam, 0], "vae": [n_vae, 0]}}
             workflow[n_save] = {"class_type": "SaveImage", "inputs": {"images": [n_dec, 0], "filename_prefix": f"keyframe_{i:03d}"}}
             vae_decodes.append(n_dec)
 
         # VHS Video Combine (if available) or SaveAnimatedPNG fallback
         if vae_decodes:
+            # Note: We need to combine frames or interpolate them. The current generate_video just passes vae_decodes[0] which is one frame!
+            # Since RIFE isn't loaded here (just saving frames), we must at least concat them, or rely on client-side encoding.
+            # Actually, let's use VHS_VideoCombine properly if we can, but it takes an image batch. 
+            # To fix it quickly, let's use ImageBatch nodes if there are multiple.
+            batch_out = vae_decodes[0]
+            for i in range(1, len(vae_decodes)):
+                n_batch = nid()
+                workflow[n_batch] = {"class_type": "ImageBatch", "inputs": {"image1": [batch_out, 0], "image2": [vae_decodes[i], 0]}}
+                batch_out = n_batch
+
             n_vid = nid()
             workflow[n_vid] = {
                 "class_type": "VHS_VideoCombine",
                 "inputs": {
-                    "images": [vae_decodes[0], 0],
+                    "images": [batch_out, 0],
                     "frame_rate": output_fps,
                     "loop_count": 0,
                     "filename_prefix": "music_video",
@@ -480,11 +511,15 @@ def serve():
         output_dir = COMFYUI_DIR / "output"
         if output_dir.exists():
             import glob as _glob
+            submitted_at = info.get("submitted_at", 0)
             for ext in ["*.mp4", "*.webm", "*.gif", "*.mov"]:
                 for video_path in _glob.glob(str(output_dir / ext)):
                     try:
-                        video_data = Path(video_path).read_bytes()
-                        fn = Path(video_path).name
+                        path = Path(video_path)
+                        if path.stat().st_mtime < submitted_at or path.stat().st_size <= 0:
+                            continue
+                        video_data = path.read_bytes()
+                        fn = path.name
                         output_files.append({
                             "filename": fn,
                             "size_bytes": len(video_data),

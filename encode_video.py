@@ -44,7 +44,7 @@ def encode_with_crossfade(frame_files, output_path, fps=24, transition_duration=
     
     # Scale all inputs to same size and set fps
     for i, _ in enumerate(frame_files):
-        filter_parts.append(f"[{i}:v]scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}];")
+        filter_parts.append(f"[{i}:v]scale='trunc(iw/2)*2':'trunc(ih/2)*2',setsar=1,fps={fps},format=yuv420p[v{i}];")
     
     # Chain xfade transitions
     # [v0][v1]xfade=transition=fade:duration=D:offset=O[out0]

@@ -258,7 +258,6 @@ def build_music_video_keyframes(
 
 def build_interpolation_pipeline(
     keyframe_node_ids: list,
-    keyframe_node_ids: list,
     frames_per_transition: int = 12,
     output_fps: int = 24,
     output_prefix: str = "interpolated",
